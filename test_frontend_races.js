@@ -18,6 +18,26 @@
  *  - the current run's normal polling, history selection, refresh-before-
  *    return-to-live and terminate keep working.
  *
+ * Same-run polling-ordering regressions (overlapping polls of ONE run):
+ *
+ *  - when an older poll is waiting on history and a newer poll has already
+ *    displayed/been adopted with pause #2, the older poll's stale list
+ *    (containing only pause #1) arriving after the user selected pause #2
+ *    must NOT be treated as an eviction (no message, no kick back to live,
+ *    no dropdown/selection/highlight rollback);
+ *  - an older poll's late stale state (pause #1/#2) landing after a newer
+ *    poll adopted pause #2/#3 must not roll back liveState, pause_seq,
+ *    badge, prompt or buttons, and must send no further history request;
+ *  - a genuine server-side eviction (the newest poll's list no longer
+ *    contains the selected pause) is still reported and returns to live.
+ *
+ * Terminal finalization must not depend on history replies or on being the
+ * newest poll: at finish/exception/terminate, even if later polls are
+ * perpetually in flight and /api/pauses replies are held forever, the page
+ * stops polling, unlocks the editor and permits rerun, while history already
+ * fetched stays reviewable and late history replies still populate the
+ * dropdown. A normal finish closes cleanly as well.
+ *
  * Run standalone:        node test_frontend_races.js
  * Run via the suite:     python3 -m unittest test_races -v
  * Exit code is non-zero on the first assertion failure batch.
@@ -35,6 +55,7 @@ function check(cond, msg) {
   } else {
     failures++;
     console.error("FAIL - " + msg);
+    scheduleFailFast();
   }
 }
 function eq(actual, expected, msg) {
@@ -43,8 +64,28 @@ function eq(actual, expected, msg) {
     failures++;
     console.error(`FAIL - ${msg}: expected ${JSON.stringify(expected)}, ` +
                   `got ${JSON.stringify(actual)}`);
+    scheduleFailFast();
   } else {
     console.log("ok - " + msg);
+  }
+}
+// Exit immediately on the first failed batch: without this, a later step can
+// hang against unfixed code (the terminal-lock bug leaves a poll parked on an
+// unanswered request), the Node event loop drains and the process would
+// leave with status 0, masking the failure. The check is scheduled as a
+// microtask so it fires even from mid-scenario hangs (the awaited promise
+// never resumes; the pending microtask still runs once the stack unwinds).
+function failFastIfBroken() {
+  if (failures) {
+    console.error(`\n${failures} frontend assertion(s) failed`);
+    process.exit(1);
+  }
+}
+let failFastScheduled = false;
+function scheduleFailFast() {
+  if (failures && !failFastScheduled) {
+    failFastScheduled = true;
+    Promise.resolve().then(failFastIfBroken);
   }
 }
 
@@ -215,6 +256,16 @@ async function answerPoll(id, st, pauseList) {
 }
 const optionTexts = () => elements.history.children.map((o) => o.textContent);
 const activeIntervals = () => Array.from(intervals.keys());
+// Text of the gutter ({"→ ..": highlighted}) of the currently rendered line
+// rows; lets assertions read which source line the listing highlights.
+const listingRows = () =>
+  elements.listing.children.map((row) =>
+    row.children[0] ? row.children[0].textContent : "");
+const highlightedLine = () => {
+  const row = listingRows().find((t) => t.startsWith("→"));
+  return row ? Number(String(row).trim().replace(/^→\s*/, "")) : null;
+};
+const localsText = () => elements.locals.tbody.textContent;
 
 // Drop every request still pending from a previous scenario: those poll
 // chains captured an older run id and their resolution is irrelevant to the
@@ -518,12 +569,266 @@ async function scenarioCurrentRunFeatures() {
     "[5] history still reviewable after termination");
 }
 
+// ===========================================================================
+// Scenario 6: same-run polling regression — an older poll must never roll
+// back a newer poll's adopted state/history (false eviction + live rollback)
+// ===========================================================================
+
+async function scenarioSameRunStalePolls() {
+  await resetForScenario();
+  await admitRun("six");
+  await answerPoll("six", state("six", "paused", 1, { current_line: 1 }),
+    [pause(1, 1, {})]);
+
+  // --- history-mode false eviction, exact ordering from the report ---
+  // An older poll is already waiting on its /api/pauses 200 while the NEWER
+  // poll returns first and is adopted with pause #2 (dropdown/view show #2).
+  // The user selects pause #2, and only THEN does the older poll's held
+  // history reply return — carrying the stale list generated earlier, which
+  // contains pause #1 only.
+  const older = evalApp("poll()");
+  const newer = evalApp("poll()");
+  await tick();
+  const reqStateOlder = take(isState, "older poll state");
+  const reqStateNewer = take(isState, "newer poll state");
+
+  // Older poll's state (pause #1 era) lands and its history 200 is produced,
+  // then held without resolving.
+  reqStateOlder.resolve(jsonResponse(200,
+    state("six", "paused", 1, { current_line: 1 })));
+  await tick();
+  const olderPauses = take(pausesFor("six"), "older poll held pauses 200");
+
+  // Newer poll answers first with pause #2 and the fresh 2-entry list; it is
+  // adopted. The user now selects pause #2 from the dropdown.
+  reqStateNewer.resolve(jsonResponse(200,
+    state("six", "paused", 2, { current_line: 2 })));
+  await tick();
+  take(pausesFor("six"), "newer poll pauses").resolve(jsonResponse(200, {
+    run_id: "six",
+    pauses: [pause(1, 1, {}), pause(2, 2, { x: "1" })],
+  }));
+  await newer;
+  await tick();
+  check(optionTexts().some((t) => t.includes("停顿 #2")),
+    "[6] dropdown shows newer pause #2");
+  elements.history.value = "2";
+  elements.history.dispatch("change", { target: elements.history });
+  await tick();
+  eq(highlightedLine(), 2, "[6] selected pause #2 renders line 2");
+  eq(evalApp("pauseSeq"), 2, "[6] live pause_seq is 2");
+
+  // The held older history 200 now returns with the STALE [#1]-only list.
+  olderPauses.resolve(jsonResponse(200,
+    { run_id: "six", pauses: [pause(1, 1, {})] }));
+  await older;
+  await tick();
+  eq(elements.message.textContent, "",
+    "[6] stale #1-only list does NOT report pause #2 as evicted");
+  eq(elements["history-banner"].hidden, false,
+    "[6] stays in history view, not kicked back to live");
+  eq(highlightedLine(), 2, "[6] highlight stays on the selected pause #2");
+  check(optionTexts().some((t) => t.includes("#2")),
+    "[6] dropdown keeps the newer pause #2 entry");
+  check(elements["btn-step"].disabled && elements["btn-continue"].disabled,
+    "[6] controls stay disabled in history mode");
+
+  // --- live-mode rollback: late stale state must not win in live view ---
+  elements.history.value = "";
+  elements.history.dispatch("change", { target: elements.history });
+  await tick();
+  take(isState, "return-to-live state").resolve(jsonResponse(200,
+    state("six", "paused", 2, { current_line: 2 })));
+  await tick();
+  take(pausesFor("six"), "return-to-live pauses").resolve(jsonResponse(200, {
+    run_id: "six",
+    pauses: [pause(1, 1, {}), pause(2, 2, { x: "1" })],
+  }));
+  await tick();
+  check(!elements["btn-step"].disabled, "[6] controls re-enabled back live");
+
+  // Two overlapping polls: newer adopts pause #3; the older's stale pause-#2
+  // state lands afterwards and must be dropped wholesale (it must never even
+  // fetch its history list).
+  const old2 = evalApp("poll()");
+  const new2 = evalApp("poll()");
+  await tick();
+  const old2State = take(isState, "older2 state");
+  const new2State = take(isState, "newer2 state");
+  new2State.resolve(jsonResponse(200,
+    state("six", "paused", 3, { current_line: 3, locals: { x: "2" } })));
+  await tick();
+  take(pausesFor("six"), "newer2 pauses").resolve(jsonResponse(200, {
+    run_id: "six",
+    pauses: [pause(1, 1, {}), pause(2, 2, { x: "1" }), pause(3, 3, { x: "2" })],
+  }));
+  await new2;
+  await tick();
+  eq(evalApp("pauseSeq"), 3, "[6] pause_seq advanced to 3");
+
+  old2State.resolve(jsonResponse(200,
+    state("six", "paused", 2, { current_line: 2 })));
+  await old2;
+  await tick();
+  eq(evalApp("pauseSeq"), 3, "[6] late stale state does not roll pause_seq back");
+  eq(elements.status.textContent, "已暂停", "[6] badge unchanged");
+  eq(pending.filter((r) => pausesFor("six")(r)).length, 0,
+    "[6] dropped stale state fetches no history");
+  check(!elements["btn-step"].disabled, "[6] buttons untouched by stale poll");
+}
+
+// ===========================================================================
+// Scenario 7: terminal finalize with later polls perpetually in flight and a
+// held /api/pauses reply — the page must unlock, stop polling and permit
+// rerun; history stays reviewable and a late history reply still populates it
+// ===========================================================================
+
+async function scenarioTerminalWithInflightPolls() {
+  await resetForScenario();
+  await admitRun("seven");
+  await answerPoll("seven", state("seven", "paused", 1), [pause(1, 1, {})]);
+  const intervalId = activeIntervals()[0];
+
+  const termP = evalApp("terminateRun()");
+  await tick();
+  take(isControl("terminate"), "POST /api/terminate")
+    .resolve(jsonResponse(200, { ok: true, status: "terminated" }));
+  await termP;
+  await tick();
+  // terminateRun() triggered a poll (P0); the interval fires another (P1).
+  const p0 = take(isState, "terminal poll state");
+  evalApp("poll()"); // P1: a later poll, still in flight
+  await tick();
+  const p1 = take(isState, "later poll state");
+  // Yet another later poll exists and its STATE reply is held forever: under
+  // the old "only the newest poll may finalize" rule the page would stay
+  // locked waiting for P1 (and for P0's history reply).
+  evalApp("poll()");
+  await tick();
+  const p2 = take(isState, "perpetually-in-flight poll state");
+
+  // P0 receives the terminal state; its /api/pauses reply is then held.
+  p0.resolve(jsonResponse(200,
+    state("seven", "terminated", 1, { current_line: 1 })));
+  await tick();
+  const p0Pauses = take(pausesFor("seven"), "terminal poll pauses (held)");
+
+  // Finalize must already have happened, without the history reply and
+  // despite P1/P2 being newer and in flight.
+  eq(elements.status.textContent, "已终止", "[7] badge terminated immediately");
+  eq(elements.code.readOnly, false,
+    "[7] source editable even while history reply and later polls are held");
+  check(elements["btn-run"].disabled === false, "[7] rerun enabled");
+  check(elements["btn-terminate"].disabled, "[7] terminate disabled at terminal");
+  check(!activeIntervals().includes(intervalId),
+    "[7] polling stopped despite in-flight newer polls");
+  check(optionTexts().some((t) => t.includes("停顿 #1")),
+    "[7] previously fetched history stays reviewable");
+  // History view on the retained snapshot still works.
+  elements.history.value = "1";
+  elements.history.dispatch("change", { target: elements.history });
+  await tick();
+  eq(elements["history-banner"].hidden, false, "[7] can still review pause #1");
+  check(elements["btn-step"].disabled && elements["btn-continue"].disabled,
+    "[7] step/continue disabled while reviewing a terminated run");
+
+  // A rerun is admitted while P0's history reply is still held and P1/P2
+  // state replies are outstanding: nothing late can relock or re-terminate.
+  await admitRun("sevenB");
+  eq(elements.code.readOnly, true, "[7] new run locks the editor again");
+  check(activeIntervals().length === 1, "[7] new run polls on its own timer");
+
+  // The held old history 200 and P1/P2 old terminal states land now: they
+  // describe the OLD run and must be dropped silently (no relock, no rerun
+  // disable, no extra poll, no message).
+  p0Pauses.resolve(jsonResponse(200,
+    { run_id: "seven", pauses: [pause(1, 1, {})] }));
+  p1.resolve(jsonResponse(200,
+    state("seven", "terminated", 1, { current_line: 1 })));
+  p2.resolve(jsonResponse(200,
+    state("seven", "terminated", 1, { current_line: 1 })));
+  await tick(); await tick();
+  eq(elements.message.textContent, "", "[7] late old-terminal polls are silent");
+  eq(elements.code.readOnly, true, "[7] editor stays locked for the new run");
+  check(elements["btn-run"].disabled, "[7] new run not stopped by old terminals");
+  check(!elements["btn-terminate"].disabled, "[7] terminate stays for new run");
+  check(activeIntervals().length === 1, "[7] new run timer untouched");
+
+  await answerPoll("sevenB", state("sevenB", "paused", 1), [pause(1, 1, {})]);
+  eq(elements.status.textContent, "已暂停", "[7] new run reaches its pause");
+  // Outstanding old-run history requests (created by dropped P1/P2 after
+  // state guard) are irrelevant; leave them and reset.
+}
+
+// ===========================================================================
+// Scenario 8: normal finish closes cleanly (single in-flight poll) and a
+// genuine eviction is still reported
+// ===========================================================================
+
+async function scenarioNormalFinishAndEviction() {
+  await resetForScenario();
+  await admitRun("eight");
+  await answerPoll("eight", state("eight", "paused", 1), [pause(1, 1, {})]);
+  const intervalId = activeIntervals()[0];
+  check(!elements["btn-terminate"].disabled, "[8] terminate enabled while paused");
+
+  // Natural finish arrives on the single outstanding poll: clean finalize.
+  evalApp("poll()");
+  await tick();
+  take(isState, "finish state").resolve(jsonResponse(200,
+    state("eight", "finished", 1, { current_line: null })));
+  await tick();
+  take(pausesFor("eight"), "finish pauses").resolve(jsonResponse(200, {
+    run_id: "eight",
+    pauses: [pause(1, 1, {})],
+  }));
+  await tick(); await flushTimeouts();
+  eq(elements.status.textContent, "已结束", "[8] badge finished");
+  eq(elements.code.readOnly, false, "[8] editor editable after finish");
+  check(elements["btn-run"].disabled === false, "[8] rerun enabled after finish");
+  check(elements["btn-terminate"].disabled, "[8] terminate disabled at finish");
+  check(!activeIntervals().includes(intervalId), "[8] timer cleared after finish");
+  check(optionTexts().some((t) => t.includes("停顿 #1")),
+    "[8] history reviewable after finish");
+
+  // Genuine eviction: the NEWEST poll of a run returns a list that no longer
+  // contains the selected pause (server dropped it beyond the retention).
+  await admitRun("nine");
+  await answerPoll("nine",
+    state("nine", "paused", 101, { current_line: 5 }),
+    [pause(100, 4, { x: "99" }), pause(101, 5, { x: "100" })]);
+  elements.history.value = "100";
+  elements.history.dispatch("change", { target: elements.history });
+  await tick();
+  evalApp("poll()");
+  await tick();
+  take(isState, "evicting state").resolve(jsonResponse(200,
+    state("nine", "paused", 102, { current_line: 6 })));
+  await tick();
+  take(pausesFor("nine"), "evicting pauses").resolve(jsonResponse(200, {
+    run_id: "nine",
+    pauses: [pause(101, 5, { x: "100" }), pause(102, 6, { x: "101" })],
+  }));
+  await tick(); await flushTimeouts();
+  check(elements.message.textContent.includes("#100")
+    && elements.message.textContent.includes("淘汰"),
+    "[8] genuine eviction still reported with the pause number");
+  eq(elements["history-banner"].hidden, true,
+    "[8] eviction returns to live view");
+  check(!elements["btn-step"].disabled, "[8] live controls re-enabled after eviction");
+}
+
 async function main() {
   await scenarioTwoOldPollChains();
   await scenarioLateStepResponse();
   await scenarioLateTerminateResponse();
   await scenarioRejectedAndRacingAdmissions();
   await scenarioCurrentRunFeatures();
+  await scenarioSameRunStalePolls();
+  failFastIfBroken();  // unfixed code parks on the terminal-lock scenario next
+  await scenarioTerminalWithInflightPolls();
+  failFastIfBroken();
+  await scenarioNormalFinishAndEviction();
   await tick();
   await flushTimeouts();
   if (failures) {

@@ -63,6 +63,10 @@ let historySig = "";     // dropdown contents signature, to avoid rebuilding
 // 每次 poll 开始时自增：同运行的重叠轮询（间隔轮询与手动 poll）只有最新
 // 一轮允许落地，旧轮询在任意 await 之后恢复时都必须自我丢弃。
 let pollSeq = 0;
+// 已采纳内容的最新轮询序号（同一次采纳里 state 与 pauses 共享一代）。
+// 同运行内一旦较晚轮询已采纳状态，较早轮询即为“被取代”：它迟到的旧状态、
+// 旧历史列表一律丢弃，不得回退 liveState/pause_seq/徽标/下拉/选中项/提示/按钮。
+let adoptedPollSeq = 0;
 // 每次“获准启动的新运行”自增：/api/run 的迟到拒绝（如双击中落败的那一个
 // 请求、等待回收期间排队的重跑）不得在新运行获准后再弹错误提示。
 let admitSeq = 0;
@@ -138,6 +142,7 @@ async function startRun() {
   pauseSeq = 0;
   liveState = null;
   pauses = [];
+  adoptedPollSeq = 0;  // 新运行重新计代，上一运行的轮询世代随之作废
   historySig = null;  // 强制下次重建下拉框，清掉上一个运行的停顿条目
   exitHistoryView();
   showMessage("");    // 清掉同批失败请求可能已显示的 409 提示
@@ -194,13 +199,19 @@ async function fetchPauses(forRunId) {
 
 async function poll() {
   if (!runId) return;
-  // 每轮轮询一个序号，仅在“终态收尾”（停轮询/切按钮/解除只读）时使用：
-  // 同一次运行的重叠轮询里，只有最新一轮允许收尾，旧一轮即使拿着终态也
-  // 不得停掉当前轮询。归属（run_id）则在每一个 await 之后都校验，保证
-  // 旧运行的状态/停顿响应绝不会写入新运行。
+  // 每轮轮询一个序号。两层防护：
+  // 1) 归属（run_id）：在每一个 await 之后都校验，旧运行的状态/停顿/终态
+  //    响应即使迟到也绝不写入新运行，更不能替新运行收尾（停轮询/解除只读/
+  //    切换终止按钮）。
+  // 2) 同运行代际（pollSeq / adoptedPollSeq）：较晚轮询一旦采纳状态，较早
+  //    轮询即被取代——它迟到的旧状态与“只含更旧停顿”的历史列表必须整体
+  //    丢弃，不得回退历史、选中项、liveState、pause_seq、徽标、提示或按钮
+  //    （否则会把实时视图回退到旧停顿，并把仍在列表中的所选停顿误报为
+  //    “已淘汰”）。
   const myPollSeq = ++pollSeq;
   const myRunId = runId;
   const newRunTookOver = () => runId !== myRunId;
+  const superseded = () => adoptedPollSeq > myPollSeq;
 
   let data;
   try {
@@ -209,16 +220,36 @@ async function poll() {
   } catch (e) {
     return;
   }
-  // 旧运行的迟到状态响应不得覆盖新运行：run_id 不匹配直接丢弃。
-  if (newRunTookOver() || data.run_id !== myRunId) return;
+  // 旧运行的迟到状态不覆盖新运行；同运行里较晚轮询已采纳更新状态时，这轮
+  // 较早轮询的旧状态（旧 pause_seq/旧 status/旧行号与变量）整体丢弃。
+  if (newRunTookOver() || data.run_id !== myRunId || superseded()) return;
+
+  // 有效终态立即收尾，且不等待历史响应：即使此后总有“更晚一轮”的轮询在
+  // 飞行中（其 state/pauses 因卡顿/丢包迟迟不回），页面也不会一直只读、
+  // 不能重跑。历史快照在终态后仍可通过下拉回看；随后到达的历史响应只更新
+  // 下拉。终态收尾只校验归属（不校验代际）：本轮终态来自当前运行，服务端
+  // 终态粘滞，任何在途的更新轮询都不会再产生更“新”的活动态；归属校验则
+  // 保证旧运行的终态不会替新运行收尾。
+  const terminal = ["finished", "exception", "terminated"].includes(data.status);
+  if (terminal) {
+    stopPolling();
+    setRunningUI(false);
+  }
+
   liveState = data;
   pauseSeq = data.pause_seq;
   renderStatusBadge(data.status);
+  adoptedPollSeq = myPollSeq;
+  // 实时视图立即用最新状态渲染（含按状态启用/禁用按钮），不等历史请求；
+  // 历史模式保持定格，稍后只在历史阶段按需渲染。
+  if (!inHistoryMode()) renderView(data);
 
   // 历史请求在重跑获准之前可能已经拿到 200，却等到现在才完成：这里对
-  // 返回值再次校验归属，旧运行的停顿列表绝不能写入新运行。
+  // 返回值再次校验归属，旧运行的停顿列表绝不能写入新运行；同运行内若已被
+  // 较晚轮询取代，旧列表（可能只含已被更新列表超越的停顿）也不得覆盖较新
+  // 的历史/选中项与“已淘汰”判定。
   const latest = await fetchPauses(myRunId);
-  if (newRunTookOver()) return;
+  if (newRunTookOver() || superseded()) return;
   if (latest) pauses = latest;
   populateHistory();
 
@@ -228,25 +259,17 @@ async function poll() {
       // 轮询继续更新实时状态（徽标/下拉），但不切走所选历史记录
       renderHistory(selected);
     } else {
-      // 所选记录已被淘汰：提示并返回实时视图（liveState 刚刷新过）
+      // 到这里的列表一定属于“当前运行 + 当前最新代际”：找不到所选记录只
+      // 可能是服务端真的淘汰了它（旧轮询的短列表会在上方代际校验处被丢弃，
+      // 不会再误报淘汰）。提示并返回实时视图（liveState 刚刷新过）。
       showLive(data, `停顿 #${viewingSeq} 已超出最近保留条数被淘汰，已返回实时视图`);
     }
-  } else {
-    renderView(data);
   }
 
-  if (["finished", "exception", "terminated"].includes(data.status)) {
-    // 结束/异常/终止后停止轮询，但历史停顿仍可回看。必须同时确认：仍属
-    // 于当前运行、且这是最新一轮轮询——旧轮询的旧终态不得停掉新运行的
-    // 轮询、解除源码只读或启用/禁用终止按钮。
-    if (newRunTookOver() || pollSeq !== myPollSeq) return;
-    stopPolling();
-    setRunningUI(false);
-    // 终态后若停在历史视图，保持其控制禁用状态
-    if (inHistoryMode()) {
-      $("btn-step").disabled = true;
-      $("btn-continue").disabled = true;
-    }
+  if (terminal && inHistoryMode()) {
+    // 终态后停在历史视图：保持单步/继续禁用（终止/编辑已在上方恢复）。
+    $("btn-step").disabled = true;
+    $("btn-continue").disabled = true;
   }
 }
 
